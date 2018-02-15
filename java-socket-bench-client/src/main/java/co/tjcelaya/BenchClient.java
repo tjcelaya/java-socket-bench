@@ -2,13 +2,11 @@ package co.tjcelaya;
 
 
 import com.codahale.metrics.Counter;
-import com.codahale.metrics.Histogram;
 import com.codahale.metrics.MetricRegistry;
 import com.codahale.metrics.Timer;
 import picocli.CommandLine;
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
+import java.io.PrintWriter;
 import java.net.Socket;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
@@ -34,17 +32,20 @@ public class BenchClient implements Runnable {
     @CommandLine.Parameters(index = "1",
                             arity = "1")
     private int serverPort = 0;
+
+    @CommandLine.Option(names = {"-t", "--threads"},
+                        description = "Threads which can create and close connections.")
+    private static int threadCount = 1;
+
     private static final Timer TIMER;
     private static final Counter TOTAL;
     private static final Counter ERRORS;
-    private static final Histogram TIME_DELTA_NS;
 
     static {
         final MetricRegistry registry = new MetricRegistry();
         TIMER = registry.timer(MetricRegistry.name(BenchClient.class, "connections"));
         TOTAL = registry.counter(MetricRegistry.name(BenchClient.class, "total"));
         ERRORS = registry.counter(MetricRegistry.name(BenchClient.class, "errors"));
-        TIME_DELTA_NS = registry.histogram(MetricRegistry.name(BenchClient.class, "time_delta_ns"));
     }
 
 
@@ -61,27 +62,25 @@ public class BenchClient implements Runnable {
             out.println("not enabling linger");
         }
 
-        final ScheduledExecutorService pool = new ScheduledThreadPoolExecutor(1);
-        pool.scheduleAtFixedRate(() -> {
+        final ScheduledExecutorService statsPool = new ScheduledThreadPoolExecutor(1);
+        statsPool.scheduleAtFixedRate(() -> {
             try {
                 out.println(
                         String.format(
-                                "%s rate (rps) min %d mean %.05f max %d " +
-                                        "1m %.05f 5m %.05f 15m %.05f " +
-                                        "total %d errors %d " +
-                                        "diff (min %d mean %.05f max %d)",
+                                "%s min (ns) %d max (ns) %d rate (Hz) mean %.02f " +
+                                        "1m %.02f 5m %.02f 15m %.02f " +
+                                        "total %d errors %d threads %d linger %b",
                                 role,
                                 TIMER.getSnapshot().getMin(),
-                                TIMER.getMeanRate(),
                                 TIMER.getSnapshot().getMax(),
+                                TIMER.getMeanRate(),
                                 TIMER.getOneMinuteRate(),
                                 TIMER.getFiveMinuteRate(),
                                 TIMER.getFiveMinuteRate(),
                                 TOTAL.getCount(),
                                 ERRORS.getCount(),
-                                TIME_DELTA_NS.getSnapshot().getMin(),
-                                TIME_DELTA_NS.getSnapshot().getMean(),
-                                TIME_DELTA_NS.getSnapshot().getMax()
+                                threadCount,
+                                zeroLinger
                         )
                 );
             } catch (final Exception e) {
@@ -90,38 +89,50 @@ public class BenchClient implements Runnable {
             }
         }, 1, 1, TimeUnit.SECONDS);
 
-        try {
+        final Thread[] threads = new Thread[threadCount];
+
+        for (int i = 0; i < threads.length; i++) {
+            final Thread t = new Thread(new ClientWorker(serverIp, serverPort));
+            t.start();
+            threads[i] = t;
+        }
+
+        out.println(String.format("client threads started (%d)", threadCount));
+
+        for (int i = 0; i < threads.length; i++) {
+            try {
+                threads[i].join();
+            } catch (final InterruptedException e) {
+                throw new RuntimeException(e);
+            }
+        }
+    }
+
+    private static final class ClientWorker implements Runnable {
+
+        private final String serverIp;
+        private final int serverPort;
+
+        ClientWorker(final String serverIp, final int serverPort) {
+            this.serverIp = serverIp;
+            this.serverPort = serverPort;
+        }
+
+        @Override
+        public void run() {
             while (true) {
-
-                final Timer.Context time = TIMER.time();
-
                 try (final Socket s = new Socket(serverIp, serverPort);
-                     final BufferedReader input = new BufferedReader(new InputStreamReader(s.getInputStream()))) {
-
-                    if (zeroLinger) {
-                        if (verbose) {
-                            out.println("setting socket linger to true + zero");
-                        }
-
-                        s.setKeepAlive(false);
-                        s.setSoLinger(true, 0);
-                    }
-
-                    final String server_ns = input.readLine();
-                    final long delta_ns = System.nanoTime() - Long.parseUnsignedLong(server_ns);
-
-                    if (verbose) out.println("delta nanos: " + delta_ns);
-
-                    time.close();
-                    TIME_DELTA_NS.update(delta_ns);
+                     final Timer.Context time = TIMER.time();
+                     final PrintWriter writer = new PrintWriter(s.getOutputStream(), true)) {
+                    final long ns = System.nanoTime();
+                    if (verbose) out.println("server nanos: " + ns);
+                    writer.println(ns);
                 } catch (final Exception e) {
                     ERRORS.inc();
                 } finally {
                     TOTAL.inc();
                 }
             }
-        } catch (final Exception e) {
-            e.printStackTrace(err);
         }
     }
 }
