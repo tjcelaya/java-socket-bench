@@ -10,9 +10,11 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 import static java.lang.System.err;
@@ -32,7 +34,7 @@ public class BenchServer implements Runnable {
 
     @CommandLine.Option(names = {"-t", "--threads"},
                         description = "Number of worker threads. The listener hands sockets off to them for responses.")
-    private static int threadCount = 1;
+    protected static int threadCount = 1;
 
     private final ConcurrentLinkedQueue<TimedSocket> clients = new ConcurrentLinkedQueue<>();
 
@@ -57,42 +59,13 @@ public class BenchServer implements Runnable {
             throw new RuntimeException("Port is required");
         }
 
+        final ArrayBlockingQueue<Runnable> workQueue = new ArrayBlockingQueue<>(threadCount);
+
+        final ThreadPoolExecutor clientPool = new ThreadPoolExecutor(
+                threadCount, threadCount, 0L, TimeUnit.MILLISECONDS, workQueue);
+
         final ScheduledExecutorService statsPool = new ScheduledThreadPoolExecutor(1);
-        statsPool.scheduleAtFixedRate(() -> {
-            try {
-                out.println(
-                        String.format(
-                                "%s min (ns) %d max (ns) %d rate (Hz) mean %.02f " +
-                                        "1m %.02f 5m %.02f 15m %.02f " +
-                                        "total %d errors %d threads %d backlog %d",
-                                role,
-                                TIMER.getSnapshot().getMin(),
-                                TIMER.getSnapshot().getMax(),
-                                TIMER.getMeanRate(),
-                                TIMER.getOneMinuteRate(),
-                                TIMER.getFiveMinuteRate(),
-                                TIMER.getFiveMinuteRate(),
-                                TOTAL.getCount(),
-                                ERRORS.getCount(),
-                                threadCount,
-                                clients.size()
-                        )
-                );
-            } catch (final Exception e) {
-                e.printStackTrace(err);
-                System.exit(1);
-            }
-        }, 1, 1, TimeUnit.SECONDS);
-
-        final Thread[] threads = new Thread[threadCount];
-
-        for (int i = 0; i < threads.length; i++) {
-            final Thread t = new Thread(new ServerWorker(clients));
-            t.start();
-            threads[i] = t;
-        }
-
-        out.println(String.format("server threads started (%d)", threadCount));
+        statsPool.scheduleAtFixedRate(new StatsReporter(), 1, 1, TimeUnit.SECONDS);
 
         try (final ServerSocket listener = new ServerSocket(port)) {
             out.println("listening: " + port);
@@ -121,34 +94,56 @@ public class BenchServer implements Runnable {
         }
     }
 
+    private static final class StatsReporter implements Runnable {
+
+        @Override
+        public void run() {
+            try {
+                out.println(
+                        String.format(
+                                "%s min (ns) %d max (ns) %d rate (Hz) mean %.02f " +
+                                        "1m %.02f 5m %.02f 15m %.02f " +
+                                        "total %d errors %d threads %d backlog %d",
+                                role,
+                                TIMER.getSnapshot().getMin(),
+                                TIMER.getSnapshot().getMax(),
+                                TIMER.getMeanRate(),
+                                TIMER.getOneMinuteRate(),
+                                TIMER.getFiveMinuteRate(),
+                                TIMER.getFiveMinuteRate(),
+                                TOTAL.getCount(),
+                                ERRORS.getCount(),
+                                threadCount
+                        )
+                );
+            } catch (final Exception e) {
+                e.printStackTrace(err);
+                // bail if we can't print stats
+                System.exit(1);
+            }
+        }
+    }
+
     private static final class ServerWorker implements Runnable {
 
-        private final ConcurrentLinkedQueue<TimedSocket> clients;
+        private final TimedSocket client;
 
-        ServerWorker(final ConcurrentLinkedQueue<TimedSocket> clients) {
-            this.clients = clients;
+        ServerWorker(final TimedSocket client) {
+            this.client = client;
         }
 
         @Override
         public void run() {
-            if (verbose) out.println("accepting");
-            while (true) {
-                final TimedSocket client = clients.poll();
-                if (client == null) {
-                    continue;
-                }
-
-                try (final PrintWriter writer = new PrintWriter(client.socket.getOutputStream(), true)) {
-                    final long ns = System.nanoTime();
-                    if (verbose) out.println("server nanos: " + ns);
-                    writer.println(ns);
-                    client.socket.close();
-                    client.timerCtx.close();
-                } catch (final Exception e) {
-                    ERRORS.inc();
-                } finally {
-                    TOTAL.inc();
-                }
+            try (final PrintWriter writer = new PrintWriter(client.socket.getOutputStream(), true)) {
+                final long ns = System.nanoTime();
+                if (verbose) out.println("server nanos: " + ns);
+                writer.println(ns);
+                client.socket.close();
+                client.timerCtx.close();
+            } catch (final Exception e) {
+                ERRORS.inc();
+            } finally {
+                TOTAL.inc();
             }
         }
     }

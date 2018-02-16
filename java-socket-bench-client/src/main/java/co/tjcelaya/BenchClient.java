@@ -8,6 +8,8 @@ import picocli.CommandLine;
 
 import java.io.PrintWriter;
 import java.net.Socket;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -89,21 +91,20 @@ public class BenchClient implements Runnable {
             }
         }, 1, 1, TimeUnit.SECONDS);
 
-        final Thread[] threads = new Thread[threadCount];
-
-        for (int i = 0; i < threads.length; i++) {
-            final Thread t = new Thread(new ClientWorker(serverIp, serverPort));
-            t.start();
-            threads[i] = t;
+        final ExecutorService clientPool = Executors.newFixedThreadPool(threadCount);
+        for (int i = 0; i < threadCount; i++) {
+            clientPool.submit(new ClientWorker(serverIp, serverPort));
         }
 
         out.println(String.format("client threads started (%d)", threadCount));
 
-        for (int i = 0; i < threads.length; i++) {
+        Runtime.getRuntime().addShutdownHook(new Thread(clientPool::shutdownNow));
+
+        while (!clientPool.isTerminated()) {
             try {
-                threads[i].join();
+                clientPool.awaitTermination(1L, TimeUnit.SECONDS);
             } catch (final InterruptedException e) {
-                throw new RuntimeException(e);
+                e.printStackTrace(err);
             }
         }
     }

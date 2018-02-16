@@ -9,5 +9,6 @@
   <modules>
     <module>java-socket-bench-client</module>
     <module>java-socket-bench-server</module>
+      <module>java-cpu-bench</module>
   </modules>
 </project>
